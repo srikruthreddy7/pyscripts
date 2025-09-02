@@ -88,64 +88,86 @@ class AudioIndexer:
             sample_rate = int(audio_stream.get("sample_rate", 0) or 0)
             channels = int(audio_stream.get("channels", 0) or 0)
 
-            # 1) Prefer stream duration when present and valid
-            duration = _parse_float(audio_stream.get("duration")) if audio_stream.get("duration") not in (None, "N/A") else 0.0
+            # Collect candidate durations from multiple sources
+            candidates = []
 
-            # 2) Fallback to container/format duration
-            if duration <= 0:
-                fmt = metadata.get("format", {})
-                fmt_duration = fmt.get("duration")
-                if fmt_duration not in (None, "N/A"):
-                    duration = _parse_float(fmt_duration)
+            # 1) Stream duration
+            sd = audio_stream.get("duration")
+            if sd not in (None, "N/A"):
+                v = _parse_float(sd)
+                if v > 0:
+                    candidates.append(v)
 
-            # 3) Fallback to nb_samples/sample_rate if available
-            if duration <= 0:
-                nb_samples = audio_stream.get("nb_samples")
-                if nb_samples is not None and sample_rate:
-                    try:
-                        duration = float(nb_samples) / float(sample_rate)
-                    except Exception:
-                        pass
+            # 2) Container/format duration
+            fmt = metadata.get("format", {})
+            fd = fmt.get("duration")
+            if fd not in (None, "N/A"):
+                v = _parse_float(fd)
+                if v > 0:
+                    candidates.append(v)
 
-            # 4) Fallback to duration_ts * time_base
-            if duration <= 0:
-                dur_ts = audio_stream.get("duration_ts")
-                time_base = audio_stream.get("time_base")  # e.g., "1/16000"
-                if dur_ts and time_base and isinstance(time_base, str) and "/" in time_base:
-                    try:
-                        num, den = time_base.split("/")
-                        tb = float(num) / float(den)
-                        duration = float(dur_ts) * tb
-                    except Exception:
-                        pass
-
-            # 5) External tool fallback: soxi -D (fast metadata read)
-            if duration <= 0:
+            # 3) nb_samples / sample_rate
+            nb_samples = audio_stream.get("nb_samples")
+            if nb_samples is not None and sample_rate:
                 try:
-                    soxi = subprocess.run(
-                        ["soxi", "-D", file_path], capture_output=True, text=True, timeout=15
-                    )
-                    if soxi.returncode == 0:
-                        d = soxi.stdout.strip()
-                        if d and d.lower() != "n/a":
-                            duration = float(d)
+                    v = float(nb_samples) / float(sample_rate)
+                    if v > 0:
+                        candidates.append(v)
                 except Exception:
                     pass
 
-            # 6) Library fallback: soundfile.info (no full decode)
+            # 4) External tool: soxi -D (only if needed)
+            duration = max(candidates) if candidates else 0.0
             if duration <= 0:
+                try:
+                    soxi = subprocess.run(["soxi", "-D", file_path], capture_output=True, text=True, timeout=10)
+                    if soxi.returncode == 0:
+                        d = soxi.stdout.strip()
+                        v = _parse_float(d)
+                        if v > 0:
+                            candidates.append(v)
+                except Exception:
+                    pass
+
+            # 5) Library: soundfile.info
+            if not candidates:
                 try:
                     import soundfile as sf  # type: ignore
                     info = sf.info(file_path)
-                    if info.samplerate and info.frames:
-                        duration = float(info.frames) / float(info.samplerate)
-                        # Fill missing basic fields from soundfile if needed
+                    if getattr(info, "samplerate", 0) and getattr(info, "frames", 0):
+                        v = float(info.frames) / float(info.samplerate)
+                        if v > 0:
+                            candidates.append(v)
                         if sample_rate == 0:
                             sample_rate = int(info.samplerate)
                         if channels == 0:
                             channels = int(info.channels)
                 except Exception:
                     pass
+
+            # 6) duration_ts * time_base (guard against sentinel values)
+            if not candidates:
+                dur_ts = audio_stream.get("duration_ts")
+                time_base = audio_stream.get("time_base")  # e.g., "1/16000" or "1/48000"
+                if isinstance(dur_ts, (int, float)) and dur_ts > 0 and dur_ts < 1e12 and isinstance(time_base, str) and "/" in time_base:
+                    try:
+                        num, den = time_base.split("/")
+                        tb = float(num) / float(den)
+                        v = float(dur_ts) * tb
+                        if v > 0:
+                            candidates.append(v)
+                    except Exception:
+                        pass
+
+            # Choose a plausible duration (filter out absurd values)
+            plausible_max = MAX_AUDIO_DURATION_SEC * 100  # generous cap to ignore sentinels
+            duration = 0.0
+            for v in candidates:
+                if 0 < v < plausible_max:
+                    duration = max(duration, v)
+            # If still zero, use the largest non-zero candidate as last resort
+            if duration <= 0 and candidates:
+                duration = max(candidates)
             
             # Get file size
             file_size = os.path.getsize(file_path)
