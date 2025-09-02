@@ -1,0 +1,67 @@
+# Batch Diarization Pipeline Requirements
+# Core dependencies for Modal-based audio transcription and diarization
+
+# Modal platform
+modal>=0.55.0
+
+# Core ML/AI frameworks
+torch>=2.0.0
+torchaudio>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+accelerate>=0.20.0
+datasets>=2.12.0
+
+# NeMo toolkit for ASR (Parakeet model)
+nemo-toolkit[asr]>=1.22.0
+omegaconf>=2.3.0
+hydra-core>=1.3.0
+lightning>=2.0.0
+
+# Audio processing libraries
+librosa>=0.10.0
+soundfile>=0.12.0
+scipy>=1.10.0
+pydub>=0.25.0
+
+# Diarization specific libraries
+pyannote.audio>=3.1.0
+pyannote.core>=5.0.0
+speechbrain>=0.5.15
+
+# Data manipulation and utilities
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.65.0
+click>=8.1.0
+python-dateutil>=2.8.0
+
+# Optional dependencies for enhanced functionality
+# Uncomment if needed for specific use cases
+
+# Advanced audio processing
+# essentia>=2.1b6
+# aubio>=0.4.9
+
+# Alternative ASR libraries (fallback options)
+# openai-whisper>=20231117
+# faster-whisper>=0.9.0
+
+# Additional ML utilities
+# scikit-learn>=1.3.0
+# seaborn>=0.12.0
+# matplotlib>=3.7.0
+
+# Development and testing (uncomment for development)
+# pytest>=7.4.0
+# pytest-cov>=4.1.0
+# black>=23.7.0
+# flake8>=6.0.0
+# mypy>=1.5.0
+
+# Performance monitoring
+# psutil>=5.9.0
+# nvidia-ml-py>=12.535.0
+
+
+

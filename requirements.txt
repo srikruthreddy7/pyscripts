@@ -1,0 +1,9 @@
+pymongo>=4.6.0
+python-dotenv>=1.0.1
+requests>=2.32.3
+
+# Modal app and runtime deps
+modal>=0.62.0
+requests>=2.31.0
+
+
