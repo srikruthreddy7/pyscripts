@@ -251,7 +251,7 @@ CACHE_ENV_VARS = {
 
 # File size and processing limits
 MAX_FILE_SIZE_GB = 2.0  # Maximum file size to process
-MAX_DURATION_HOURS = 3.0  # Maximum single file duration
+MAX_DURATION_HOURS = 5.0  # Maximum single file duration (increased for 4+ hour files)
 CHUNK_DURATION_MINUTES = 30  # For chunking very long files
 
 # Validation thresholds
@@ -266,4 +266,3 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 NEMO_BATCH_SIZE_MULTIPLIER = 1.0  # Adjust based on GPU memory
 TORCH_COMPILE_ENABLE = True  # Enable torch.compile for performance
 MIXED_PRECISION = True  # Use mixed precision training/inference
-

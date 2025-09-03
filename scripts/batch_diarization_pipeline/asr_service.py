@@ -30,7 +30,7 @@ from .config import (
     CACHE_ENV_VARS,
     NEMO_BATCH_SIZE_MULTIPLIER,
     TORCH_COMPILE_ENABLE,
-    MIXED_PRECISION
+    MIXED_PRECISION,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ class ASRService:
         self.batch_size = int(batch_size * NEMO_BATCH_SIZE_MULTIPLIER)
         self.cache_dir = cache_dir
         self.model = None
+        # self.ctc_model: Optional external CTC model (not used in baseline path)
         # Resolve device lazily to avoid importing torch at module import time
         try:
             import torch  # type: ignore
@@ -92,6 +93,8 @@ class ASRService:
                     logger.warning(f"Could not enable torch.compile: {e}")
             
             self.model.eval()
+            # Leave RNNT decoding config as model default; we'll request timestamps per-file during transcribe.
+
             logger.info(f"ASR model loaded successfully on {self.device}")
             
         except Exception as e:
@@ -215,27 +218,189 @@ class ASRService:
         try:
             # Convert tensors to numpy arrays for NeMo
             audio_arrays = [tensor.numpy() for tensor in audio_tensors]
-            
-            # Transcribe with timestamps
-            results = self.model.transcribe(
-                audio_arrays,
-                return_timestamps=True,
-                batch_size=len(audio_arrays)
-            )
-            
+
+            # Transcribe with word-level alignments if supported (baseline: request timestamps for all)
+            try:
+                results = self.model.transcribe(
+                    audio_arrays,
+                    batch_size=len(audio_arrays),
+                    return_hypotheses=True,
+                    timestamps=True,
+                )
+                logger.debug("Transcription with return_hypotheses succeeded")
+            except Exception as e:
+                logger.debug(f"return_hypotheses path failed: {e}")
+                # Fallback to plain strings
+                results = self.model.transcribe(
+                    audio_arrays,
+                    batch_size=len(audio_arrays)
+                )
+                logger.debug("Using basic transcription fallback (strings only)")
+
             # Process results
             transcriptions = []
             for i, (result, file_path) in enumerate(zip(results, file_paths)):
-                if isinstance(result, str):
+                # Normalize NeMo output: may be a Hypothesis or a list/tuple of Hypotheses
+                primary = result[0] if isinstance(result, (list, tuple)) and len(result) > 0 else result
+
+                if isinstance(primary, str):
                     # Simple string result - no timestamps
                     transcription = {
                         "filename": os.path.basename(file_path),
-                        "text": result,
-                        "segments": [{"start": 0, "end": len(audio_tensors[i]) / 16000, "text": result}],
+                        "text": primary,
+                        "segments": [{"start": 0, "end": duration_sec, "text": primary}],
                         "words": []
                     }
+                elif hasattr(primary, 'text'):
+                    # NeMo Hypothesis object - extract text and word timestamps
+                    words = []
+                    segments = []
+                    
+                    # Try multiple methods to extract word-level information from Hypothesis object
+                    logger.debug(f"Processing Hypothesis object: {type(primary)}")
+                    try:
+                        logger.debug(f"Available attributes: {dir(primary)}")
+                    except Exception:
+                        pass
+                    
+                    # Preferred: Hypothesis.timestamp['word'] with start/end in seconds
+                    if hasattr(primary, 'timestamp'):
+                        try:
+                            ts = getattr(primary, 'timestamp')
+                            if isinstance(ts, dict) and ts.get('word'):
+                                for w in ts['word']:
+                                    wtext = w.get('word', '')
+                                    # Use seconds if present, else fallback to offsets (approximate)
+                                    if 'start' in w and 'end' in w:
+                                        ws = float(w.get('start') or 0)
+                                        we = float(w.get('end') or ws)
+                                    else:
+                                        # If only offsets are present, keep as 0 for now
+                                        ws = float(w.get('start_offset', 0) or 0)
+                                        we = float(w.get('end_offset', ws) or ws)
+                                    words.append({"w": wtext, "s": ws, "e": we})
+                        except Exception as e:
+                            logger.debug(f"No usable Hypothesis.timestamp found: {e}")
+
+                    # Method 1: NeMo word_timestamps (most common)
+                    if hasattr(primary, 'word_timestamps') and getattr(primary, 'word_timestamps'):
+                        wt = getattr(primary, 'word_timestamps')
+                        logger.debug(f"Found word_timestamps with {len(wt)} entries")
+                        for w in wt:
+                            try:
+                                # Support dict-like entries
+                                if isinstance(w, dict):
+                                    wtext = w.get('word', '')
+                                    ws = float(w.get('start_time', w.get('start_offset', 0)) or 0)
+                                    we = float(w.get('end_time', w.get('end_offset', ws)) or ws)
+                                else:
+                                    # Attribute-style entries
+                                    wtext = getattr(w, 'word', '')
+                                    ws = float(getattr(w, 'start_time', getattr(w, 'start_offset', 0)) or 0)
+                                    we = float(getattr(w, 'end_time', getattr(w, 'end_offset', ws)) or ws)
+                                words.append({"w": wtext, "s": ws, "e": we})
+                            except Exception as e:
+                                logger.debug(f"Error extracting word_timestamps entry: {e}")
+
+                    # Method 1b: Alternate naming 'word_ts'
+                    if not words and hasattr(primary, 'word_ts') and getattr(primary, 'word_ts'):
+                        wt = getattr(primary, 'word_ts')
+                        logger.debug(f"Found word_ts with {len(wt)} entries")
+                        for w in wt:
+                            try:
+                                if isinstance(w, dict):
+                                    wtext = w.get('word', '')
+                                    ws = float(w.get('start_time', w.get('start', 0)) or 0)
+                                    we = float(w.get('end_time', w.get('end', ws)) or ws)
+                                else:
+                                    wtext = getattr(w, 'word', '')
+                                    ws = float(getattr(w, 'start_time', getattr(w, 'start', 0)) or 0)
+                                    we = float(getattr(w, 'end_time', getattr(w, 'end', ws)) or ws)
+                                words.append({"w": wtext, "s": ws, "e": we})
+                            except Exception as e:
+                                logger.debug(f"Error extracting word_ts entry: {e}")
+
+                    # Method 2: Direct words attribute
+                    if hasattr(primary, 'words') and getattr(primary, 'words'):
+                        pw = getattr(primary, 'words')
+                        logger.debug(f"Found words attribute with {len(pw)} words")
+                        for word_info in pw:
+                            try:
+                                word_data = {}
+                                # Try different attribute names for word text
+                                if hasattr(word_info, 'word'):
+                                    word_data['w'] = word_info.word
+                                elif hasattr(word_info, 'text'):
+                                    word_data['w'] = word_info.text
+                                elif isinstance(word_info, str):
+                                    word_data['w'] = word_info
+                                    
+                                # Try different attribute names for timing
+                                if hasattr(word_info, 'start_time'):
+                                    word_data['s'] = float(word_info.start_time)
+                                elif hasattr(word_info, 'start'):
+                                    word_data['s'] = float(word_info.start)
+                                    
+                                if hasattr(word_info, 'end_time'):
+                                    word_data['e'] = float(word_info.end_time)
+                                elif hasattr(word_info, 'end'):
+                                    word_data['e'] = float(word_info.end)
+                                
+                                if 'w' in word_data and 's' in word_data and 'e' in word_data:
+                                    words.append(word_data)
+                                    logger.debug(f"Extracted word: {word_data}")
+                            except Exception as e:
+                                logger.debug(f"Error extracting word info: {e}")
+                    
+                    # Method 3: timestep attribute (NeMo specific)
+                    elif not words and hasattr(primary, 'timestep') and getattr(primary, 'timestep'):
+                        ts = getattr(primary, 'timestep')
+                        logger.debug(f"Found timestep attribute: {ts}")
+                        if isinstance(ts, dict) and 'word' in ts:
+                            word_timestamps = ts['word']
+                            for word_info in word_timestamps:
+                                try:
+                                    words.append({
+                                        "w": word_info.get('word', word_info.get('text', '')),
+                                        "s": float(word_info.get('start', word_info.get('start_time', 0))),
+                                        "e": float(word_info.get('end', word_info.get('end_time', 0)))
+                                    })
+                                except Exception as e:
+                                    logger.debug(f"Error extracting from timestep: {e}")
+
+                    # Method 4: alignments attribute
+                    elif not words and hasattr(primary, 'alignments') and getattr(primary, 'alignments'):
+                        al = getattr(primary, 'alignments')
+                        logger.debug(f"Found alignments attribute with {len(al)} items")
+                        # This would need character-to-word grouping logic
+                        # For now, just log what's available
+                        try:
+                            alignment_sample = al[0] if al else None
+                            if alignment_sample:
+                                logger.debug(f"Sample alignment attributes: {dir(alignment_sample)}")
+                        except Exception as e:
+                            logger.debug(f"Could not inspect alignments: {e}")
+                    
+                    if words:
+                        logger.info(f"Successfully extracted {len(words)} word timestamps")
+
+                    # If no word-level info, create basic segment
+                    if not words:
+                        duration = len(audio_tensors[i]) / 16000
+                        segments = [{"start": 0, "end": duration, "text": getattr(primary, 'text', '')}]
+                    else:
+                        # Create segments from words (group consecutive words)
+                        if words:
+                            segments = [{"start": words[0]["s"], "end": words[-1]["e"], "text": getattr(primary, 'text', '')}]
+                    
+                    transcription = {
+                        "filename": os.path.basename(file_path),
+                        "text": getattr(primary, 'text', ''),
+                        "segments": segments if segments else [{"start": 0, "end": len(audio_tensors[i]) / 16000, "text": getattr(primary, 'text', '')}],
+                        "words": words
+                    }
                 else:
-                    # Rich result with timestamps
+                    # Rich result with timestamps (dict format)
                     transcription = self._parse_nemo_result(result, file_path)
                     
                 transcriptions.append(transcription)
@@ -270,11 +435,10 @@ class ASRService:
             # Move to device
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Generate with timestamps
+            # Generate transcriptions
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs,
-                    return_timestamps=True,
                     max_new_tokens=500
                 )
                 

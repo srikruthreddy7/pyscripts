@@ -10,6 +10,7 @@ This module handles:
 import json
 import os
 import random
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -40,7 +41,7 @@ class AudioIndexer:
         
     def get_audio_metadata(self, file_path: str) -> Dict:
         """
-        Extract audio metadata using ffprobe (fast, no decoding).
+        Extract audio metadata using ffprobe + FFmpeg decode fallback.
         
         Args:
             file_path: Path to audio file
@@ -49,7 +50,7 @@ class AudioIndexer:
             Dict with duration, sample_rate, channels, and validation info
         """
         try:
-            # Use ffprobe to get audio metadata without decoding
+            # Use ffprobe to get audio metadata
             cmd = [
                 "ffprobe", 
                 "-v", "quiet",
@@ -78,96 +79,52 @@ class AudioIndexer:
                 logger.warning(f"No audio stream found in {file_path}")
                 return None
                 
-            # Extract relevant information with robust duration fallback
-            def _parse_float(x):
-                try:
-                    return float(x)
-                except Exception:
-                    return 0.0
-
+            # Extract basic info
             sample_rate = int(audio_stream.get("sample_rate", 0) or 0)
             channels = int(audio_stream.get("channels", 0) or 0)
-
-            # Collect candidate durations from multiple sources
-            candidates = []
-
-            # 1) Stream duration
-            sd = audio_stream.get("duration")
-            if sd not in (None, "N/A"):
-                v = _parse_float(sd)
-                if v > 0:
-                    candidates.append(v)
-
-            # 2) Container/format duration
-            fmt = metadata.get("format", {})
-            fd = fmt.get("duration")
-            if fd not in (None, "N/A"):
-                v = _parse_float(fd)
-                if v > 0:
-                    candidates.append(v)
-
-            # 3) nb_samples / sample_rate
-            nb_samples = audio_stream.get("nb_samples")
-            if nb_samples is not None and sample_rate:
-                try:
-                    v = float(nb_samples) / float(sample_rate)
-                    if v > 0:
-                        candidates.append(v)
-                except Exception:
-                    pass
-
-            # 4) External tool: soxi -D (only if needed)
-            duration = max(candidates) if candidates else 0.0
-            if duration <= 0:
-                try:
-                    soxi = subprocess.run(["soxi", "-D", file_path], capture_output=True, text=True, timeout=10)
-                    if soxi.returncode == 0:
-                        d = soxi.stdout.strip()
-                        v = _parse_float(d)
-                        if v > 0:
-                            candidates.append(v)
-                except Exception:
-                    pass
-
-            # 5) Library: soundfile.info
-            if not candidates:
-                try:
-                    import soundfile as sf  # type: ignore
-                    info = sf.info(file_path)
-                    if getattr(info, "samplerate", 0) and getattr(info, "frames", 0):
-                        v = float(info.frames) / float(info.samplerate)
-                        if v > 0:
-                            candidates.append(v)
-                        if sample_rate == 0:
-                            sample_rate = int(info.samplerate)
-                        if channels == 0:
-                            channels = int(info.channels)
-                except Exception:
-                    pass
-
-            # 6) duration_ts * time_base (guard against sentinel values)
-            if not candidates:
-                dur_ts = audio_stream.get("duration_ts")
-                time_base = audio_stream.get("time_base")  # e.g., "1/16000" or "1/48000"
-                if isinstance(dur_ts, (int, float)) and dur_ts > 0 and dur_ts < 1e12 and isinstance(time_base, str) and "/" in time_base:
-                    try:
-                        num, den = time_base.split("/")
-                        tb = float(num) / float(den)
-                        v = float(dur_ts) * tb
-                        if v > 0:
-                            candidates.append(v)
-                    except Exception:
-                        pass
-
-            # Choose a plausible duration (filter out absurd values)
-            plausible_max = MAX_AUDIO_DURATION_SEC * 100  # generous cap to ignore sentinels
+            
+            # Try to get duration from metadata first
             duration = 0.0
-            for v in candidates:
-                if 0 < v < plausible_max:
-                    duration = max(duration, v)
-            # If still zero, use the largest non-zero candidate as last resort
-            if duration <= 0 and candidates:
-                duration = max(candidates)
+            
+            # Try stream duration
+            if audio_stream.get("duration") not in (None, "N/A"):
+                try:
+                    duration = float(audio_stream.get("duration"))
+                except:
+                    pass
+            
+            # Try format duration if stream failed
+            if duration == 0.0:
+                fmt = metadata.get("format", {})
+                if fmt.get("duration") not in (None, "N/A"):
+                    try:
+                        duration = float(fmt.get("duration"))
+                    except:
+                        pass
+            
+            # If no duration from metadata, use FFmpeg decode method
+            if duration == 0.0:
+                try:
+                    ffmpeg_decode = subprocess.run(
+                        ["ffmpeg", "-i", file_path, "-f", "null", "-"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=60
+                    )
+                    
+                    if ffmpeg_decode.returncode == 0:
+                        time_matches = re.findall(r'time=(\d{2}:\d{2}:\d{2}\.\d{2})', ffmpeg_decode.stdout)
+                        if time_matches:
+                            final_time = time_matches[-1]
+                            time_parts = final_time.split(':')
+                            hours = int(time_parts[0])
+                            minutes = int(time_parts[1])
+                            seconds = float(time_parts[2])
+                            duration = hours * 3600 + minutes * 60 + seconds
+                            
+                except Exception:
+                    pass
             
             # Get file size
             file_size = os.path.getsize(file_path)
@@ -229,7 +186,7 @@ class AudioIndexer:
             
         return True
         
-    def scan_audio_files(self) -> List[Dict]:
+    def scan_audio_files(self, limit: int | None = None) -> List[Dict]:
         """
         Scan the audio directory and index all supported audio files.
         
@@ -243,6 +200,7 @@ class AudioIndexer:
         valid_files = 0
         
         # Walk through all files in the audio directory
+        stop = False
         for root, dirs, files in os.walk(self.audio_root):
             for file in files:
                 total_files += 1
@@ -275,6 +233,13 @@ class AudioIndexer:
                 # Log progress every 100 files
                 if len(audio_files) % 100 == 0:
                     logger.info(f"Processed {len(audio_files)} audio files...")
+                
+                # Respect limit for faster debugging
+                if limit is not None and len(audio_files) >= limit:
+                    stop = True
+                    break
+            if stop:
+                break
                     
         logger.info(f"Scanning complete: {total_files} total files, "
                    f"{len(audio_files)} audio files, {valid_files} valid files")

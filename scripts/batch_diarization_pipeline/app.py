@@ -55,7 +55,12 @@ image = get_modal_image()
     },
     timeout=3600,  # 1 hour timeout for indexing
 )
-def index_audio_files(job_id: str, audio_subdir: Optional[str] = None) -> Dict:
+def index_audio_files(
+    job_id: str,
+    audio_subdir: Optional[str] = None,
+    limit_files: Optional[int] = None,
+    debug: bool = False,
+) -> Dict:
     """
     Index all FLAC audio files in the volume and create request partitions.
     
@@ -65,7 +70,12 @@ def index_audio_files(job_id: str, audio_subdir: Optional[str] = None) -> Dict:
     Returns:
         Dict with indexing stats and partition info
     """
-    setup_logging()
+    # Elevate logging to DEBUG for deep inspection when requested
+    if debug:
+        from .utils import setup_logging as _setup
+        _setup(level="DEBUG")
+    else:
+        setup_logging()
     
     # Allow targeting a subdirectory inside the audio volume (e.g., 2025/08/28)
     audio_root = "/vol/audio" if not audio_subdir else str(Path("/vol/audio") / audio_subdir)
@@ -73,7 +83,7 @@ def index_audio_files(job_id: str, audio_subdir: Optional[str] = None) -> Dict:
     
     # Scan and index all audio files
     print(f"🔍 Scanning audio files in: {audio_root}")
-    index_data = indexer.scan_audio_files()
+    index_data = indexer.scan_audio_files(limit=limit_files)
     
     # Save index to results volume
     index_path = f"/vol/results/index_{job_id}.jsonl"
@@ -81,6 +91,12 @@ def index_audio_files(job_id: str, audio_subdir: Optional[str] = None) -> Dict:
     
     print(f"📊 Indexed {len(index_data)} files")
     print(f"📊 Total duration: {sum(f['duration_sec'] for f in index_data):.1f} seconds")
+    if debug:
+        # Print a concise per-file summary for quick inspection
+        for f in index_data[:10]:
+            print(
+                f" - {f['relpath']}: dur={f['duration_sec']:.3f}s, sr={f['sample_rate']}, ch={f['channels']}, bytes={f['bytes']}"
+            )
     print(f"📊 Total size: {sum(f['bytes'] for f in index_data) / (1024**3):.1f} GB")
     
     return {
@@ -89,6 +105,23 @@ def index_audio_files(job_id: str, audio_subdir: Optional[str] = None) -> Dict:
         "total_duration_sec": sum(f['duration_sec'] for f in index_data),
         "total_bytes": sum(f['bytes'] for f in index_data)
     }
+
+
+@app.function(
+    image=image,
+    volumes={
+        "/vol/audio": audio_volume,
+        "/vol/models-cache": models_cache_volume,
+        "/vol/results": results_volume,
+    },
+    timeout=1800,
+)
+def debug_index_sample(job_id: str, audio_subdir: Optional[str] = None, n: int = 10) -> Dict:
+    """Index only the first N audio files with verbose debug logs.
+
+    Returns the same dict as index_audio_files but limited to N files.
+    """
+    return index_audio_files.local(job_id=job_id, audio_subdir=audio_subdir, limit_files=n, debug=True)
 
 @app.function(
     image=image,
@@ -347,6 +380,84 @@ def batch_transcription(
     # Step 3: Process transcription requests in parallel
     print(f"\n🎤 Step 3: Processing {num_requests} transcription requests...")
     requests_path = partition_results[0]["requests_path"]
+    
+    transcription_futures = []
+    for i in range(num_requests):
+        future = process_transcription_request.spawn(
+            i, requests_path, job_id, gpu_batch_size, model_id
+        )
+        transcription_futures.append(future)
+    
+    # Wait for all transcription requests to complete
+    transcription_results = [f.get() for f in transcription_futures]
+    
+    # Generate cost report
+    total_gpu_hours = sum(r["gpu_hours"] for r in transcription_results)
+    
+    print(f"\n✅ Transcription complete!")
+    print(f"📊 Total GPU hours: {total_gpu_hours:.2f}")
+    print(f"💰 Estimated cost: ${total_gpu_hours * 1.95:.2f}")
+    print(f"📁 ASR results saved to: /vol/results/asr_interim_{job_id}/")
+
+@app.local_entrypoint()
+def test_small_transcription(
+    job_id: str = "test-small",
+    num_files: int = 5
+):
+    """
+    Test transcription on a small number of files to validate it works.
+    """
+    print(f"🧪 Testing transcription on {num_files} files from job: {job_id}")
+    
+    # Use existing request partitions but only process first few files
+    requests_path = f"/vol/results/requests_dbg-001.jsonl"
+    
+    # Load just the first request and limit files
+    with open(requests_path, 'r') as f:
+        requests = [json.loads(line) for line in f]
+    
+    first_request = requests[0]  
+    limited_files = first_request["files"][:num_files]  # Take only first N files
+    
+    print(f"🎤 Testing with {len(limited_files)} files (batch size: 2)")
+    
+    # Process with very small batch size
+    future = process_transcription_request.spawn(
+        0, requests_path, "test-small", 2, ASR_MODEL_ID  # batch_size=2
+    )
+    
+    result = future.get()
+    print(f"✅ Test completed!")
+    print(f"📊 Files processed: {result['files_processed']}")
+    print(f"💰 Cost: ${result['gpu_hours'] * 1.95:.3f}")
+    
+    return result
+
+@app.local_entrypoint()
+def transcribe_from_existing_requests(
+    job_id: str,
+    model_id: str = ASR_MODEL_ID,
+    gpu_batch_size: int = DEFAULT_GPU_BATCH_SIZE,
+    num_requests: int = DEFAULT_NUM_REQUESTS
+):
+    """
+    Run transcription using existing request partitions (skip indexing/partitioning).
+    
+    Example usage:
+    modal run app.py::transcribe_from_existing_requests --job-id dbg-001 --num-requests 10
+    """
+    print(f"🚀 Starting transcription job using existing requests: {job_id}")
+    print(f"📊 Configuration:")
+    print(f"  Model: {model_id}")
+    print(f"  GPU: {GPU_TYPE}")
+    print(f"  Batch size: {gpu_batch_size}")
+    print(f"  Concurrent requests: {num_requests}")
+    
+    # Use existing request partitions
+    requests_path = f"/vol/results/requests_{job_id}.jsonl"
+    
+    # Step 3: Process transcription requests in parallel
+    print(f"\n🎤 Processing {num_requests} transcription requests...")
     
     transcription_futures = []
     for i in range(num_requests):
