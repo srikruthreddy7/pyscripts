@@ -428,4 +428,3 @@ class DiarizationService:
             "config": self.preset_config,
             "model_id": self.model_id
         }
-

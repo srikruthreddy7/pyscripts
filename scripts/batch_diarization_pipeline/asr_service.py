@@ -30,7 +30,7 @@ from .config import (
     CACHE_ENV_VARS,
     NEMO_BATCH_SIZE_MULTIPLIER,
     TORCH_COMPILE_ENABLE,
-    MIXED_PRECISION,
+    MIXED_PRECISION
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,6 @@ class ASRService:
         self.batch_size = int(batch_size * NEMO_BATCH_SIZE_MULTIPLIER)
         self.cache_dir = cache_dir
         self.model = None
-        # self.ctc_model: Optional external CTC model (not used in baseline path)
         # Resolve device lazily to avoid importing torch at module import time
         try:
             import torch  # type: ignore
@@ -93,7 +92,21 @@ class ASRService:
                     logger.warning(f"Could not enable torch.compile: {e}")
             
             self.model.eval()
-            # Leave RNNT decoding config as model default; we'll request timestamps per-file during transcribe.
+            # Try to enable RNNT decoding timestamps globally so transcribe can return Hypotheses with word timings
+            try:
+                from omegaconf import OmegaConf  # type: ignore
+                decoding_cfg = self.model.cfg.decoding
+                # Ensure compute_timestamps is enabled in decoding config
+                if hasattr(decoding_cfg, 'compute_timestamps'):
+                    setattr(decoding_cfg, 'compute_timestamps', True)
+                else:
+                    decoding_cfg = OmegaConf.merge(decoding_cfg, {"compute_timestamps": True})
+                # Apply the decoding strategy if available
+                if hasattr(self.model, 'change_decoding_strategy'):
+                    self.model.change_decoding_strategy(decoding_cfg=decoding_cfg)
+                logger.info("Enabled RNNT timestamp decoding for ASR model")
+            except Exception as e:
+                logger.warning(f"Could not enable RNNT timestamp decoding: {e}")
 
             logger.info(f"ASR model loaded successfully on {self.device}")
             
@@ -218,9 +231,10 @@ class ASRService:
         try:
             # Convert tensors to numpy arrays for NeMo
             audio_arrays = [tensor.numpy() for tensor in audio_tensors]
-
-            # Transcribe with word-level alignments if supported (baseline: request timestamps for all)
+            
+            # Transcribe with word-level alignments if supported
             try:
+                # Preferred: request hypotheses and timestamps so Hypothesis.timestamp['word'] contains timings
                 results = self.model.transcribe(
                     audio_arrays,
                     batch_size=len(audio_arrays),
@@ -236,19 +250,23 @@ class ASRService:
                     batch_size=len(audio_arrays)
                 )
                 logger.debug("Using basic transcription fallback (strings only)")
-
+            
             # Process results
             transcriptions = []
             for i, (result, file_path) in enumerate(zip(results, file_paths)):
                 # Normalize NeMo output: may be a Hypothesis or a list/tuple of Hypotheses
-                primary = result[0] if isinstance(result, (list, tuple)) and len(result) > 0 else result
+                primary = None
+                if isinstance(result, (list, tuple)) and len(result) > 0:
+                    primary = result[0]
+                else:
+                    primary = result
 
                 if isinstance(primary, str):
                     # Simple string result - no timestamps
                     transcription = {
                         "filename": os.path.basename(file_path),
                         "text": primary,
-                        "segments": [{"start": 0, "end": duration_sec, "text": primary}],
+                        "segments": [{"start": 0, "end": len(audio_tensors[i]) / 16000, "text": primary}],
                         "words": []
                     }
                 elif hasattr(primary, 'text'):

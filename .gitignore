@@ -1,1 +1,16 @@
 .env
+.DS_Store
+__pycache__/
+*.flac
+*.pyc
+extract_flac_duration.py
+node_modules/
+package-lock.json
+package.json
+streaming_conversion_test.js
+test_enhanced_indexer.py
+test_ffmpeg_decode_simple.py
+scripts/batch_diarization_pipeline/AGENTS.md
+scripts/batch_diarization_pipeline/__pycache__/app.cpython-313.pyc
+scripts/batch_diarization_pipeline/__pycache__/app.cpython-313.pyc
+scripts/batch_diarization_pipeline/__pycache__/app.cpython-313.pyc
